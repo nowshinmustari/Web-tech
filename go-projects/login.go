@@ -5,16 +5,27 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
+
+
+type Claims struct {
+	Username string `json:"username"`
+	jwt.RegisteredClaims
+}
+
+// =========================
+// USER
+// =========================
 
 type User struct {
 	Username string
 	Password string
 }
 
-// For learning purpose only.
-// In a real application, users should come from a database
-// and passwords should be stored as bcrypt hashes.
+// Learning purpose only
 var users = map[string]User{
 	"admin": {
 		Username: "admin",
@@ -22,11 +33,22 @@ var users = map[string]User{
 	},
 }
 
-// In-memory token storage.
-// token -> username
-var tokens = map[string]string{
-	"abc123": "admin",
+// JWT secret key
+var jwtSecret = []byte("my-super-secret-key")
+
+// =========================
+// LOGIN RESPONSE
+// =========================
+
+type LoginResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Token   string `json:"token,omitempty"`
 }
+
+// =========================
+// HEALTH HANDLER
+// =========================
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 
@@ -40,56 +62,172 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Println("Error encoding response:", err)
-		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
-		return
 	}
 }
 
-func loginHandler(w http.ResponseWriter, r *http.Request) {
+// =========================
+// GENERATE JWT
+// =========================
 
-	// Only POST request is allowed
+func generateToken(username string) (string, error) {
+
+	// Token expiration: 15 minutes
+	expiresAt := time.Now().Add(15 * time.Minute)
+
+	claims := Claims{
+		Username: username,
+
+		RegisteredClaims: jwt.RegisteredClaims{
+
+			// Token expiration time
+			ExpiresAt: jwt.NewNumericDate(expiresAt),
+
+			// Token issued time
+			IssuedAt: jwt.NewNumericDate(time.Now()),
+		},
+	}
+
+	// Create JWT
+	token := jwt.NewWithClaims(
+		jwt.SigningMethodHS256,
+		claims,
+	)
+
+	// Sign JWT
+	tokenString, err := token.SignedString(jwtSecret)
+
+	if err != nil {
+		return "", err
+	}
+
+	return tokenString, nil
+}
+
+// =========================
+// VALIDATE JWT
+// =========================
+
+func validateToken(tokenString string) (*Claims, error) {
+
+	claims := &Claims{}
+
+	token, err := jwt.ParseWithClaims(
+		tokenString,
+		claims,
+
+		func(token *jwt.Token) (interface{}, error) {
+
+			// Make sure token uses HS256
+			if token.Method != jwt.SigningMethodHS256 {
+				return nil, jwt.ErrSignatureInvalid
+			}
+
+			return jwtSecret, nil
+		},
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if !token.Valid {
+		return nil, jwt.ErrTokenInvalidClaims
+	}
+
+	return claims, nil
+}
+
+// =========================
+// LOGIN HANDLER
+// =========================
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+ 
+	// Only POST allowed
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+
+		http.Error(
+			w,
+			"Method not allowed",
+			http.StatusMethodNotAllowed,
+		)
+
 		return
 	}
 
-	// Request body structure
+	// Request body
 	var loginData struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
 
-	// Convert JSON request body into Go struct
-	if err := json.NewDecoder(r.Body).Decode(&loginData); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	// Decode JSON
+	err := json.NewDecoder(r.Body).Decode(&loginData)
+
+	if err != nil {
+
+		log.Println("JSON decode error:", err)
+
+		http.Error(
+			w,
+			"Invalid JSON",
+			http.StatusBadRequest,
+		)
+
 		return
 	}
 
 	// Find user
 	user, exists := users[loginData.Username]
 
+	// Check username and password
 	if !exists || user.Password != loginData.Password {
-		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
+
+		http.Error(
+			w,
+			"Invalid username or password",
+			http.StatusUnauthorized,
+		)
+
 		return
 	}
 
-	// For learning purpose, token is fixed.
-	// In a real application, generate a secure random token/JWT.
-	token := "abc123"
+	// Generate JWT
+	token, err := generateToken(user.Username)
 
-	// Save token
-	tokens[token] = user.Username
+	if err != nil {
 
-	response := map[string]interface{}{
-		"msg":   "Login successful",
-		"token": token,
+		log.Println("JWT generation error:", err)
+
+		http.Error(
+			w,
+			"Failed to generate token",
+			http.StatusInternalServerError,
+		)
+
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	// Response
+	response := LoginResponse{
+		Status:  "OK",
+		Message: "Login successful",
+		Token:   token,
+	}
+
+	w.Header().Set(
+		"Content-Type",
+		"application/json",
+	)
+
 	w.WriteHeader(http.StatusOK)
 
 	json.NewEncoder(w).Encode(response)
 }
+
+// =========================
+// AUTH MIDDLEWARE
+// =========================
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
@@ -99,36 +237,67 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		authHeader := r.Header.Get("Authorization")
 
 		// Example:
-		// Authorization: Bearer abc123
+		// Authorization: Bearer eyJhbGciOiJIUzI1Ni...
 
 		if authHeader == "" {
-			http.Error(w, "Authorization header required", http.StatusUnauthorized)
+
+			http.Error(
+				w,
+				"Authorization header required",
+				http.StatusUnauthorized,
+			)
+
 			return
 		}
 
-		// Check "Bearer " prefix
+		// Check Bearer prefix
 		if !strings.HasPrefix(authHeader, "Bearer ") {
-			http.Error(w, "Invalid authorization format", http.StatusUnauthorized)
+
+			http.Error(
+				w,
+				"Invalid authorization format",
+				http.StatusUnauthorized,
+			)
+
 			return
 		}
 
-		// Extract token
-		token := strings.TrimPrefix(authHeader, "Bearer ")
+		// Extract JWT
+		tokenString := strings.TrimPrefix(
+			authHeader,
+			"Bearer ",
+		)
 
-		// Check token
-		username, exists := tokens[token]
+		// Validate JWT
+		claims, err := validateToken(tokenString)
 
-		if !exists {
-			http.Error(w, "Invalid token", http.StatusUnauthorized)
+		if err != nil {
+
+			log.Println("JWT validation error:", err)
+
+			http.Error(
+				w,
+				"Invalid or expired token",
+				http.StatusUnauthorized,
+			)
+
 			return
 		}
 
-		log.Println("Authenticated user:", username)
+		// Authenticated username
+		log.Println(
+			"Authenticated user:",
+			claims.Username,
+		)
 
 		// Authentication successful
 		next(w, r)
 	}
 }
+
+// =========================
+// PROTECTED HANDLER
+// =========================
 
 func protectedHandler(w http.ResponseWriter, r *http.Request) {
 
@@ -137,29 +306,56 @@ func protectedHandler(w http.ResponseWriter, r *http.Request) {
 		"status": 200,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(
+		"Content-Type",
+		"application/json",
+	)
+
 	w.WriteHeader(http.StatusOK)
 
 	json.NewEncoder(w).Encode(response)
 }
+func profileHandler(w http.ResponseWriter, r *http.Request){
+	w.Header().set("Content_type","application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message":"This should be private.but right now anyone can see it"
+	})
+}
+
+// =========================
+// MAIN
+// =========================
 
 func main() {
+mux:=http.NewServeMux()
 
 	// Public endpoint
-	http.HandleFunc("/api/v1/health", healthHandler)
+	mux.HandleFunc(
+		"/api/v1/health",
+		healthHandler,
+	)
 
 	// Login endpoint
-	http.HandleFunc("/api/v1/login", loginHandler)
+	mux.HandleFunc(
+		"/api/v1/login",
+		loginHandler,
+	)
 
 	// Protected endpoint
-	http.HandleFunc(
+	mux.HandleFunc(
 		"/api/v1/profile",
 		authMiddleware(protectedHandler),
 	)
-
-	log.Println("Server running on http://localhost:8080")
+addr:=":8080"
+	log.Println(
+		"Server running on",8080
+	)
 
 	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal("Server failed to start:", err)
+
+		log.Fatal(
+			"Server failed to start:",
+			err,
+		)
 	}
 }
